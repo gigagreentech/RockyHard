@@ -1,0 +1,12 @@
+# LUKS key files — never commit
+*.key
+
+# Timestamped evidence and backup snapshots
+artifacts/
+backups/
+logs/
+
+# OS noise
+.DS_Store
+*~
+*.swp
