@@ -42,14 +42,14 @@ CATEGORY_DESCS=(
     "Foundational services required by other modules — SMTP relay"
     "Password policy, user administration, logon banners, and session timeouts"
     "Antivirus, USB control, FIPS compliance, system updates, and time sync"
-    "SSH hardening, firewall rules, SELinux enforcement, and kernel parameters"
+    "Network interface configuration — IP addressing and network controls"
     "Additional hardening controls reserved for future modules"
 )
 
 CATEGORY_MODULES_prerequisites="hostname smtp_relay"
 CATEGORY_MODULES_access_control="password_policy users mfa logon_banner session_timeout"
 CATEGORY_MODULES_system_comms="antivirus usb_control fips updates time_sync encryption"
-CATEGORY_MODULES_networking="ssh firewall selinux kernel"
+CATEGORY_MODULES_networking="networking firewall"
 CATEGORY_MODULES_expansion="packages filesystem auditd"
 
 # Per-module descriptions shown in sub-menus (requires bash 4+)
@@ -67,10 +67,8 @@ MODULE_DESC[fips]="Run a 5-point FIPS 140 compliance check; optionally enable FI
 MODULE_DESC[updates]="List and apply all pending package updates via dnf/yum/apt; check whether a reboot is required"
 MODULE_DESC[encryption]="OS drive FDE status, second boot passphrase, recovery keyfile, data disk encryption, FDE setup guide, and recovery guide"
 MODULE_DESC[time_sync]="Configure NTP time source from a preset or custom list; set timezone; verify clock synchronisation"
-MODULE_DESC[ssh]="Harden /etc/ssh/sshd_config — disable root login and password auth, restrict ciphers and MACs"
-MODULE_DESC[firewall]="Configure firewalld — set default zone to drop, open only explicitly required service ports"
-MODULE_DESC[selinux]="Verify SELinux is in enforcing mode with targeted policy; set enforcing if permissive"
-MODULE_DESC[kernel]="Apply sysctl kernel hardening — disable IP forwarding, restrict ICMP redirects, enable ASLR"
+MODULE_DESC[networking]="Configure network interfaces — set static IP or DHCP, prefix, gateway, and DNS via NetworkManager"
+MODULE_DESC[firewall]="Enable and configure firewalld — manage zones, allow/block services and ports"
 MODULE_DESC[packages]="Remove known unnecessary packages (telnet, rsh, etc.) and disable unused services"
 MODULE_DESC[filesystem]="Restrict permissions on sensitive files; apply noexec/nosuid/nodev to /tmp, /var/tmp, /dev/shm"
 MODULE_DESC[auditd]="Install auditd and deploy a baseline ruleset covering logins, privilege escalation, and file access"

@@ -82,6 +82,102 @@ source "$SCRIPT_DIR/../../lib/common.sh"
 # Fall back to 900 s (15 minutes) if the config value is absent or empty.
 SESSION_TIMEOUT="${SESSION_TIMEOUT:-900}"
 
+# APPLY_TIMEOUT is what gets written to system files. It starts at the
+# configured default and may be overridden by the user at runtime.
+APPLY_TIMEOUT="$SESSION_TIMEOUT"
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+_header() {
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────┐"
+    printf  "  │  %-55s│\n" "$1"
+    echo "  └─────────────────────────────────────────────────────────┘"
+    echo ""
+}
+
+# Prompt for a positive integer with a visible default (Enter accepts default).
+_prompt_int() {
+    local prompt="$1" varname="$2" default="$3" min="${4:-1}"
+    while true; do
+        read -rp "  $prompt [$default]: " _val
+        _val="${_val:-$default}"
+        if [[ "$_val" =~ ^[0-9]+$ ]] && (( _val >= min )); then
+            printf -v "$varname" "%s" "$_val"; break
+        else
+            echo "  Must be an integer >= $min."
+        fi
+    done
+}
+
+# =============================================================================
+# Action: View existing timeout values
+# =============================================================================
+
+action_show_values() {
+    _header "Current Timeout Values — Live System State"
+
+    local tmout_val ssh_interval ssh_count_max dconf_delay dconf_lock_enabled
+    local ssh_status gui_status
+
+    tmout_val=$(grep -E "^readonly TMOUT=" /etc/profile.d/session_timeout.sh 2>/dev/null \
+        | cut -d= -f2 || echo "not configured")
+
+    ssh_interval=$(grep -E "^\s*ClientAliveInterval\s" /etc/ssh/sshd_config 2>/dev/null \
+        | awk '{print $2}' || echo "not configured")
+    ssh_count_max=$(grep -E "^\s*ClientAliveCountMax\s" /etc/ssh/sshd_config 2>/dev/null \
+        | awk '{print $2}' || echo "not configured")
+
+    if [[ -f /etc/dconf/db/local.d/01-session-timeout ]]; then
+        dconf_delay=$(grep "idle-delay" /etc/dconf/db/local.d/01-session-timeout 2>/dev/null \
+            | grep -oP '\d+' || echo "not set")
+        dconf_lock_enabled=$(grep "lock-enabled" /etc/dconf/db/local.d/01-session-timeout 2>/dev/null \
+            | awk -F= '{print $2}' | tr -d ' ' || echo "not set")
+        gui_status="Configured"
+    elif ! command_exists dconf; then
+        dconf_delay="N/A"; dconf_lock_enabled="N/A"
+        gui_status="Skipped (dconf not installed)"
+    else
+        dconf_delay="N/A"; dconf_lock_enabled="N/A"
+        gui_status="Not configured"
+    fi
+
+    [[ -f /etc/ssh/sshd_config ]] && ssh_status="Configured" || ssh_status="Not found"
+
+    printf "  %-30s %s\n" "Config default (config.conf):" "${SESSION_TIMEOUT}s ($(( SESSION_TIMEOUT / 60 )) minutes)"
+    echo ""
+    echo "  Shell / Console  (/etc/profile.d/session_timeout.sh)"
+    printf "    %-26s %s\n" "TMOUT:" "$tmout_val"
+    echo ""
+    echo "  SSH  (/etc/ssh/sshd_config)  — $ssh_status"
+    printf "    %-26s %s\n" "ClientAliveInterval:" "$ssh_interval"
+    printf "    %-26s %s\n" "ClientAliveCountMax:" "$ssh_count_max"
+    echo ""
+    echo "  GUI / GNOME dconf  — $gui_status"
+    printf "    %-26s %s\n" "idle-delay:" "$dconf_delay"
+    printf "    %-26s %s\n" "lock-enabled:" "$dconf_lock_enabled"
+    echo ""
+}
+
+# =============================================================================
+# Action: Configure custom timeout
+# =============================================================================
+
+action_configure_timeout() {
+    _header "Configure Session Timeout"
+    echo "  Press Enter to keep the current configured value shown in brackets."
+    echo ""
+    _prompt_int \
+        "Idle timeout in seconds (e.g. 900 = 15 min, 1800 = 30 min)" \
+        APPLY_TIMEOUT \
+        "$APPLY_TIMEOUT" \
+        60
+    echo ""
+    log_info "Timeout set to ${APPLY_TIMEOUT}s ($(( APPLY_TIMEOUT / 60 )) minutes) for this session."
+}
+
 # --- Shell / console timeout ---
 apply_shell_timeout() {
     local profile_file="/etc/profile.d/session_timeout.sh"
@@ -93,12 +189,12 @@ apply_shell_timeout() {
     cat > "$profile_file" <<EOF
 # Managed by hardening/modules/session_timeout — do not edit manually.
 # Satisfies CMMC AC.L2-3.1.11 (Session Termination).
-readonly TMOUT=${SESSION_TIMEOUT}
+readonly TMOUT=${APPLY_TIMEOUT}
 export TMOUT
 EOF
 
     chmod 644 "$profile_file"
-    log_info "Shell/console timeout set to ${SESSION_TIMEOUT}s via $profile_file."
+    log_info "Shell/console timeout set to ${APPLY_TIMEOUT}s via $profile_file."
 }
 
 # --- SSH session timeout ---
@@ -116,11 +212,11 @@ apply_ssh_timeout() {
     # Replace any existing ClientAliveInterval line (active or commented) in
     # place to avoid duplicates.  Append if no such line exists.
     if grep -qE "^\s*#*\s*ClientAliveInterval" "$sshd_config"; then
-        sed -i "s|^\s*#*\s*ClientAliveInterval.*|ClientAliveInterval ${SESSION_TIMEOUT}|" "$sshd_config"
-        log_info "SSH ClientAliveInterval updated to ${SESSION_TIMEOUT}s."
+        sed -i "s|^\s*#*\s*ClientAliveInterval.*|ClientAliveInterval ${APPLY_TIMEOUT}|" "$sshd_config"
+        log_info "SSH ClientAliveInterval updated to ${APPLY_TIMEOUT}s."
     else
-        echo "ClientAliveInterval ${SESSION_TIMEOUT}" >> "$sshd_config"
-        log_info "SSH ClientAliveInterval ${SESSION_TIMEOUT}s appended to $sshd_config."
+        echo "ClientAliveInterval ${APPLY_TIMEOUT}" >> "$sshd_config"
+        log_info "SSH ClientAliveInterval ${APPLY_TIMEOUT}s appended to $sshd_config."
     fi
 
     # ClientAliveCountMax 0 means the connection is dropped after the very first
@@ -173,7 +269,7 @@ apply_gui_timeout() {
     backup_file "$settings_file"
     cat > "$settings_file" <<EOF
 [org/gnome/desktop/session]
-idle-delay=uint32 ${SESSION_TIMEOUT}
+idle-delay=uint32 ${APPLY_TIMEOUT}
 
 [org/gnome/desktop/screensaver]
 lock-enabled=true
@@ -194,7 +290,7 @@ EOF
     log_info "GNOME timeout keys locked — users cannot override via Settings."
 
     dconf update
-    log_info "GUI session timeout set to ${SESSION_TIMEOUT}s (GNOME dconf)."
+    log_info "GUI session timeout set to ${APPLY_TIMEOUT}s (GNOME dconf)."
 }
 
 # --- Artifact ---
@@ -239,7 +335,7 @@ Satisfies  : CMMC AC.L2-3.1.11 (Session Termination)
 
 CONFIGURED TIMEOUT
 ------------------
-  Timeout : ${SESSION_TIMEOUT}s ($(( SESSION_TIMEOUT / 60 )) minutes)
+  Timeout : ${APPLY_TIMEOUT}s ($(( APPLY_TIMEOUT / 60 )) minutes)
 
 SHELL / CONSOLE TIMEOUT  (/etc/profile.d/session_timeout.sh)
 -------------------------------------------------------------
@@ -264,12 +360,50 @@ EOF
     log_info "Artifact saved: $artifact"
 }
 
-# --- Main ---
+# =============================================================================
+# Main TUI loop
+# =============================================================================
+
 log_section "Session Timeout"
 
-apply_shell_timeout
-apply_ssh_timeout
-apply_gui_timeout
+while true; do
+    _header "Session Timeout  (config default: ${SESSION_TIMEOUT}s = $(( SESSION_TIMEOUT / 60 )) min  |  this session: ${APPLY_TIMEOUT}s)"
+    echo "  Enforces idle session termination across SSH, shell/console, and GUI."
+    echo "  Satisfies CMMC AC.L2-3.1.11."
+    echo ""
+    echo "    1) View existing timeout values   — show live values from system files"
+    printf "    2) Apply timeout                  — write %ss (%s min) to all enforcement points\n" \
+        "$APPLY_TIMEOUT" "$(( APPLY_TIMEOUT / 60 ))"
+    echo "    3) Configure custom timeout        — set a different value for this session"
+    echo "    4) Exit"
+    echo ""
+    read -rp "  Selection [1-4, default=2]: " _sel
+    echo ""
 
-save_artifact
-log_info "Session timeout module complete."
+    case "${_sel:-2}" in
+        1)
+            action_show_values
+            ;;
+        2)
+            apply_shell_timeout
+            apply_ssh_timeout
+            apply_gui_timeout
+            save_artifact
+            log_info "Session timeout module complete — ${APPLY_TIMEOUT}s applied."
+            ;;
+        3)
+            action_configure_timeout
+            ;;
+        4)
+            log_info "Exiting session timeout module."
+            exit 0
+            ;;
+        *)
+            echo "  Invalid selection."
+            ;;
+    esac
+
+    echo ""
+    read -rp "  Return to session timeout menu? [Y/n]: " _again
+    [[ "${_again,,}" =~ ^n ]] && break
+done
