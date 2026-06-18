@@ -43,14 +43,14 @@ CATEGORY_DESCS=(
     "Password policy, user administration, logon banners, and session timeouts"
     "Antivirus, USB control, FIPS compliance, system updates, and time sync"
     "Network interface configuration — IP addressing and network controls"
-    "Additional hardening controls reserved for future modules"
+    "Application allow-listing, package removal, filesystem hardening, and audit logging"
 )
 
 CATEGORY_MODULES_prerequisites="hostname smtp_relay"
 CATEGORY_MODULES_access_control="password_policy users mfa logon_banner session_timeout"
 CATEGORY_MODULES_system_comms="antivirus usb_control fips updates time_sync encryption"
 CATEGORY_MODULES_networking="networking firewall"
-CATEGORY_MODULES_expansion="packages filesystem auditd"
+CATEGORY_MODULES_expansion="packages filesystem auditd app_control"
 
 # Per-module descriptions shown in sub-menus (requires bash 4+)
 declare -A MODULE_DESC
@@ -72,6 +72,11 @@ MODULE_DESC[firewall]="Enable and configure firewalld — manage zones, allow/bl
 MODULE_DESC[packages]="Remove known unnecessary packages (telnet, rsh, etc.) and disable unused services"
 MODULE_DESC[filesystem]="Restrict permissions on sensitive files; apply noexec/nosuid/nodev to /tmp, /var/tmp, /dev/shm"
 MODULE_DESC[auditd]="Install auditd and deploy a baseline ruleset covering logins, privilege escalation, and file access"
+MODULE_DESC[app_control]="Allow-list trusted applications via fapolicyd — block untrusted executables in enforcing mode"
+
+declare -A MODULE_NAME
+MODULE_NAME[app_control]="Application Control"
+MODULE_NAME[networking]="Network Setup"
 
 # =============================================================================
 # Core helpers
@@ -241,7 +246,7 @@ show_category_menu() {
         else
             status_label="disabled"
         fi
-        printf "  %s)  %-20s [%s]\n" "$((i + 1))" "$module" "$status_label"
+        printf "  %s)  %-20s [%s]\n" "$((i + 1))" "${MODULE_NAME[$module]:-$module}" "$status_label"
         printf "       %s\n" "${MODULE_DESC[$module]:-No description available.}"
         echo ""
         i=$(( i + 1 ))
