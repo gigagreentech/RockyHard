@@ -82,10 +82,49 @@ _get_mode() {
     fi
 }
 
-_reload_fapolicyd() {
+# fapolicyd-cli --update signals the running daemon via /run/fapolicyd/fapolicyd.fifo,
+# which only exists while the daemon is up. Skip it (and the SIGHUP reload) when
+# stopped — trust.d changes are already on disk and apply on next start.
+_fapolicyd_update() {
     if _fapolicyd_running; then
+        fapolicyd-cli --update
         systemctl kill -s SIGHUP fapolicyd 2>/dev/null || true
+    else
+        log_warn "fapolicyd is not running — trust changes will apply when it starts (option 2)."
     fi
+}
+
+_deploy_default_rules() {
+    local _rules_src="/usr/share/fapolicyd/sample-rules"
+    local _rules_dst="/etc/fapolicyd/rules.d"
+    local _rulelist="/usr/share/fapolicyd/default-ruleset.known-libs"
+
+    if [[ ! -f "$_rulelist" ]]; then
+        log_warn "Default ruleset list not found at $_rulelist — skipping rule deployment."
+        return
+    fi
+    if [[ ! -d "$_rules_dst" ]]; then
+        mkdir -p "$_rules_dst"
+    fi
+
+    log_info "Deploying default fapolicyd rules from $_rules_src..."
+    local _rule _deployed=0
+    while IFS= read -r _rule; do
+        [[ -z "$_rule" || "$_rule" == \#* ]] && continue
+        local _src="$_rules_src/$_rule"
+        if [[ -f "$_src" ]]; then
+            cp "$_src" "$_rules_dst/$_rule"
+            _deployed=$(( _deployed + 1 ))
+        else
+            log_warn "Rule file not found: $_src"
+        fi
+    done < "$_rulelist"
+
+    log_info "Deployed $_deployed rule files. Compiling..."
+    fagenrules --load 2>/dev/null \
+        || fagenrules 2>/dev/null \
+        || log_warn "fagenrules failed — check /etc/fapolicyd/rules.d/ manually."
+    log_info "Rules compiled and loaded."
 }
 
 _save_artifact() {
@@ -180,8 +219,12 @@ action_toggle() {
         log_section "Installing fapolicyd"
         dnf install -y fapolicyd
         log_info "fapolicyd installed."
-        echo ""
-        echo -e "  ${YELLOW}Tip: start in permissive mode to audit before switching to enforcing.${NC}"
+
+        # Deploy the default ruleset. The package ships rules in
+        # /usr/share/fapolicyd/sample-rules/ but does not deploy them
+        # automatically — without rules in rules.d/, fagenrules produces
+        # nothing and fapolicyd allows all executions despite running.
+        _deploy_default_rules
         echo ""
     fi
 
@@ -196,10 +239,44 @@ action_toggle() {
     else
         echo "  fapolicyd is currently stopped."
         echo ""
-        read -rp "  Start and enable fapolicyd? [Y/n]: " _ok
-        [[ "${_ok,,}" =~ ^n ]] && { log_info "Cancelled."; return; }
+        echo "  Which mode should it start in?"
+        echo "    1) Permissive  — log untrusted execution attempts, do not block (recommended first run)"
+        echo "    2) Enforcing   — block untrusted executables from running"
+        echo "    3) Cancel"
+        echo ""
+        read -rp "  Selection [1-3, default=1]: " _mode_sel
+        echo ""
+
+        local _new_val _new_name
+        case "${_mode_sel:-1}" in
+            1) _new_val=1; _new_name="permissive" ;;
+            2) _new_val=0; _new_name="enforcing"  ;;
+            3) log_info "Cancelled."; return ;;
+            *) echo "  Invalid selection."; return ;;
+        esac
+
+        if [[ "$_new_name" == "enforcing" ]]; then
+            echo -e "  ${RED}╔═══════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "  ${RED}║  WARNING — ENFORCING MODE                                   ║${NC}"
+            echo -e "  ${RED}║  Any executable NOT in the trust database will be BLOCKED.  ║${NC}"
+            echo -e "  ${RED}║  Ensure your trust list is complete before proceeding.      ║${NC}"
+            echo -e "  ${RED}╚═══════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            read -rp "  Type 'enforce' to confirm: " _confirm
+            [[ "$_confirm" == "enforce" ]] || { log_info "Cancelled."; return; }
+        fi
+
+        if [[ -f "$FAPOLICYD_CONF" ]]; then
+            backup_file "$FAPOLICYD_CONF"
+            if grep -q "^permissive[[:space:]]*=" "$FAPOLICYD_CONF" 2>/dev/null; then
+                sed -i "s/^permissive[[:space:]]*=.*/permissive = ${_new_val}/" "$FAPOLICYD_CONF"
+            else
+                echo "permissive = ${_new_val}" >> "$FAPOLICYD_CONF"
+            fi
+        fi
+
         systemctl enable --now fapolicyd
-        log_info "fapolicyd started and enabled in $(_get_mode) mode."
+        log_info "fapolicyd started and enabled in ${_new_name} mode."
     fi
     _save_artifact
 }
@@ -284,13 +361,14 @@ action_add_trust() {
     echo ""
     echo "  Options:"
     echo "    1) Add a single file by path"
-    echo "    2) Add all executables in a directory"
-    echo "    3) Back"
+    echo "    2) Add all executables in a directory (recursive)"
+    echo "    3) Trust VS Code remote server"
+    echo "    4) Back"
     echo ""
-    read -rp "  Selection [1-3, default=3]: " _sel
+    read -rp "  Selection [1-4, default=4]: " _sel
     echo ""
 
-    case "${_sel:-3}" in
+    case "${_sel:-4}" in
         1)
             local _path=""
             while true; do
@@ -310,14 +388,13 @@ action_add_trust() {
             read -rp "  Add '$_path' to trust? [Y/n]: " _ok
             [[ "${_ok,,}" =~ ^n ]] && { log_info "Cancelled."; return; }
             fapolicyd-cli --add --trust-file "$_path"
-            fapolicyd-cli --update
-            _reload_fapolicyd
+            _fapolicyd_update
             log_info "'$_path' added to trust database."
             ;;
         2)
             local _dir=""
             while true; do
-                read -rp "  Directory path (e.g. /usr/local/bin): " _dir
+                read -rp "  Directory path (e.g. /home/user/.vscode-server): " _dir
                 [[ -n "$_dir" ]] && break
                 echo "  Path cannot be empty."
             done
@@ -325,28 +402,125 @@ action_add_trust() {
                 log_warn "Directory not found: $_dir"
                 return
             fi
+            echo ""
+            echo "  Scanning '$_dir' recursively for executables..."
             local -a _execs
-            mapfile -t _execs < <(find "$_dir" -maxdepth 1 -type f -executable 2>/dev/null \
-                | sort || true)
+            mapfile -t _execs < <(find "$_dir" -type f -executable 2>/dev/null | sort || true)
             if [[ ${#_execs[@]} -eq 0 ]]; then
-                log_info "No executables found in $_dir"
+                log_info "No executables found under $_dir"
                 return
             fi
-            echo ""
-            echo "  Found ${#_execs[@]} executables in $_dir:"
+            echo "  Found ${#_execs[@]} executables:"
             printf "    %s\n" "${_execs[@]}"
             echo ""
             read -rp "  Add all ${#_execs[@]} to trust? [Y/n]: " _ok
             [[ "${_ok,,}" =~ ^n ]] && { log_info "Cancelled."; return; }
-            local _f
+            local _f _added=0
             for _f in "${_execs[@]}"; do
-                fapolicyd-cli --add --trust-file "$_f" 2>/dev/null || true
+                fapolicyd-cli --add --trust-file "$_f" 2>/dev/null && _added=$(( _added + 1 )) || true
             done
-            fapolicyd-cli --update
-            _reload_fapolicyd
-            log_info "Added ${#_execs[@]} executables from $_dir to trust."
+            _fapolicyd_update
+            log_info "Added $_added executables from '$_dir' to trust."
             ;;
-        3) return ;;
+        3)
+            echo "  VS Code Remote SSH installs a server under ~/.vscode-server/ which"
+            echo "  is not an RPM package and is blocked by fapolicyd in enforcing mode."
+            echo ""
+            echo -e "  ${YELLOW}Important: VS Code cannot install its server while fapolicyd is in${NC}"
+            echo -e "  ${YELLOW}enforcing mode. This option follows a three-step process:${NC}"
+            echo -e "  ${YELLOW}  1) Switch to permissive mode temporarily${NC}"
+            echo -e "  ${YELLOW}  2) You reconnect via VS Code to let the server install/update${NC}"
+            echo -e "  ${YELLOW}  3) Trust the installed files, then switch back to enforcing${NC}"
+            echo ""
+
+            # Step 1 — ensure permissive so VS Code server can install
+            local _mode_before
+            _mode_before=$(_get_mode)
+            if [[ "$_mode_before" == "enforcing" ]]; then
+                read -rp "  Switch to permissive mode now so VS Code server can install? [Y/n]: " _ok
+                [[ "${_ok,,}" =~ ^n ]] && { log_info "Cancelled."; return; }
+                if grep -q "^permissive[[:space:]]*=" "$FAPOLICYD_CONF" 2>/dev/null; then
+                    sed -i "s/^permissive[[:space:]]*=.*/permissive = 1/" "$FAPOLICYD_CONF"
+                else
+                    echo "permissive = 1" >> "$FAPOLICYD_CONF"
+                fi
+                systemctl restart fapolicyd
+                log_info "fapolicyd switched to permissive mode."
+            fi
+
+            # Step 2 — wait for user to connect VS Code
+            echo ""
+            echo "  fapolicyd is now in permissive mode."
+            echo "  Connect via VS Code Remote SSH now to let the server install or update."
+            echo "  Once VS Code shows as connected, return here and press Enter."
+            echo ""
+            read -rp "  Press Enter when VS Code has connected and the server is installed..."
+            echo ""
+
+            # Step 3 — scan and trust
+            local -a _vs_dirs=()
+            local _home
+            while IFS= read -r _home; do
+                [[ -d "$_home/.vscode-server" ]] && _vs_dirs+=("$_home/.vscode-server")
+            done < <(awk -F: '$3 >= 1000 && $3 < 65534 {print $6}' /etc/passwd)
+            [[ -d /root/.vscode-server ]] && _vs_dirs+=(/root/.vscode-server)
+
+            if [[ ${#_vs_dirs[@]} -eq 0 ]]; then
+                echo -e "  ${RED}No ~/.vscode-server directories found.${NC}"
+                echo "  VS Code may not have connected successfully."
+                echo "  If fapolicyd was switched to permissive, restore enforcing via option 10."
+                echo ""
+                return
+            fi
+
+            echo "  Found VS Code server directories:"
+            printf "    %s\n" "${_vs_dirs[@]}"
+            echo ""
+            echo "  Scanning for executables..."
+            local -a _execs=()
+            local _d
+            for _d in "${_vs_dirs[@]}"; do
+                mapfile -t -O "${#_execs[@]}" _execs < <(
+                    find "$_d" -type f -executable 2>/dev/null | sort || true)
+            done
+
+            if [[ ${#_execs[@]} -eq 0 ]]; then
+                log_warn "No executables found in VS Code server directories."
+                return
+            fi
+
+            echo "  Found ${#_execs[@]} executables."
+            read -rp "  Trust all VS Code server executables? [Y/n]: " _ok
+            [[ "${_ok,,}" =~ ^n ]] && { log_info "Cancelled."; return; }
+
+            local _f _added=0
+            for _f in "${_execs[@]}"; do
+                fapolicyd-cli --add --trust-file "$_f" 2>/dev/null && _added=$(( _added + 1 )) || true
+            done
+            _fapolicyd_update
+            log_info "Trusted $_added VS Code server executables."
+
+            # Step 4 — restore enforcing if we switched away from it
+            if [[ "$_mode_before" == "enforcing" ]]; then
+                echo ""
+                read -rp "  Switch back to enforcing mode now? [Y/n]: " _ok
+                if [[ ! "${_ok,,}" =~ ^n ]]; then
+                    sed -i "s/^permissive[[:space:]]*=.*/permissive = 0/" "$FAPOLICYD_CONF"
+                    systemctl restart fapolicyd
+                    log_info "fapolicyd switched back to enforcing mode."
+                    echo ""
+                    echo "  VS Code should now connect in enforcing mode."
+                else
+                    echo ""
+                    echo -e "  ${YELLOW}fapolicyd is still in permissive mode. Use option 10 to re-enable enforcing.${NC}"
+                fi
+            fi
+
+            echo ""
+            echo -e "  ${YELLOW}Note: each time VS Code updates its server, new binaries are downloaded.${NC}"
+            echo -e "  ${YELLOW}Run this option again after any VS Code extension update.${NC}"
+            ;;
+        4) return ;;
         *) echo "  Invalid selection." ;;
     esac
     _save_artifact
@@ -388,8 +562,7 @@ action_remove_trust() {
     [[ "${_ok,,}" =~ ^y ]] || { log_info "Cancelled."; return; }
 
     fapolicyd-cli --delete --trust-file "$_path"
-    fapolicyd-cli --update
-    _reload_fapolicyd
+    _fapolicyd_update
     log_info "'$_path' removed from trust database."
     _save_artifact
 }
@@ -410,8 +583,7 @@ action_sync_rpm() {
     [[ "${_ok,,}" =~ ^n ]] && { log_info "Cancelled."; return; }
 
     log_info "Updating trust database from RPM..."
-    fapolicyd-cli --update
-    _reload_fapolicyd
+    _fapolicyd_update
     log_info "Trust database updated from RPM database."
     _save_artifact
 }
@@ -585,41 +757,110 @@ action_view_audit_log() {
 
     _require_fapolicyd || return
 
+    local _audit_log="/var/log/audit/audit.log"
+    local _has_ausearch=false
+    local _has_auditlog=false
+    command_exists ausearch           && _has_ausearch=true
+    [[ -r "$_audit_log" ]]           && _has_auditlog=true
+
+    echo "  deny_audit rules write to the Linux audit subsystem (auditd),"
+    echo "  not the systemd journal. Denials appear in $_audit_log."
+    echo ""
     echo "  Options:"
-    echo "    1) Recent denials      — last 50 blocked or flagged execution attempts"
-    echo "    2) Follow live         — stream new entries in real time (Ctrl+C to stop)"
-    echo "    3) Full service log    — last 100 fapolicyd journal entries"
-    echo "    4) Back"
+    echo "    1) Recent denials      — last 50 blocked execution attempts (audit log)"
+    echo "    2) Follow live         — stream new denials in real time (Ctrl+C to stop)"
+    echo "    3) Filter by path      — show denials for a specific binary path"
+    echo "    4) fapolicyd service log — daemon startup and trust database messages"
+    echo "    5) Back"
     echo ""
-    read -rp "  Selection [1-4, default=1]: " _sel
+    read -rp "  Selection [1-5, default=1]: " _sel
     echo ""
+
+    # FANOTIFY audit type = 1700. Some auditd versions log as "type=FANOTIFY",
+    # others as the numeric "type=1700" — match both.
+    local _fanotify_pat="type=FANOTIFY\|type=1700"
 
     case "${_sel:-1}" in
         1)
-            echo "  Recent denials:"
+            echo "  Recent fapolicyd events (last 50):"
+            echo "  Fields: fname = blocked binary | exe = caller | comm = command name"
             printf "  %s\n" "$(printf '%.0s─' {1..56})"
-            local _denials
-            _denials=$(journalctl -u fapolicyd --no-pager 2>/dev/null \
-                | grep -iE "denied|DENY|decision=deny|trust_subject=no" | tail -50 || true)
+            local _denials=""
+            if [[ "$_has_ausearch" == true ]]; then
+                _denials=$(ausearch -m fanotify -i --start today 2>/dev/null | tail -300 || true)
+            elif [[ "$_has_auditlog" == true ]]; then
+                _denials=$(grep "$_fanotify_pat" "$_audit_log" 2>/dev/null | tail -50 || true)
+            fi
             if [[ -z "$_denials" ]]; then
-                echo "  (no denials found — fapolicyd may be in permissive mode or no untrusted"
-                echo "   executables have been run)"
+                echo "  (no fapolicyd audit entries found today)"
+                if ! systemctl is-active auditd &>/dev/null; then
+                    echo -e "  ${RED}auditd is not running — start it with: systemctl start auditd${NC}"
+                fi
+                echo "  Tip: deny_audit rules require auditd running to produce log entries."
             else
                 echo "$_denials" | sed 's/^/  /'
             fi
             ;;
         2)
-            echo "  Following fapolicyd log — press Ctrl+C to stop."
+            local _cur_mode_live
+            _cur_mode_live=$(_get_mode)
+            echo "  Following fapolicyd audit events — press Ctrl+C to stop."
+            echo "  Fields: fname = blocked binary | exe = caller | comm = command name"
+            if [[ "$_cur_mode_live" == "permissive" ]]; then
+                echo -e "  ${YELLOW}Mode: permissive — events show resp=allow even for would-be denials.${NC}"
+            else
+                echo -e "  ${RED}Mode: enforcing — resp=deny entries are active blocks.${NC}"
+            fi
+            if ! systemctl is-active auditd &>/dev/null; then
+                echo -e "  ${RED}auditd is not running — no entries will appear. Start it first.${NC}"
+                echo ""
+                return
+            fi
             echo ""
-            journalctl -u fapolicyd -f 2>/dev/null | sed 's/^/  /' || true
+            if [[ "$_has_auditlog" == true ]]; then
+                tail -f "$_audit_log" 2>/dev/null \
+                    | grep --line-buffered "$_fanotify_pat" \
+                    | sed 's/^/  /' || true
+            else
+                log_warn "Cannot read $_audit_log — ensure auditd is running and you are root."
+            fi
             ;;
         3)
-            echo "  Last 100 fapolicyd journal entries:"
+            local _path=""
+            while true; do
+                read -rp "  Binary path to filter (e.g. /tmp/mytool): " _path
+                [[ -n "$_path" ]] && break
+                echo "  Cannot be empty."
+            done
+            echo ""
+            echo "  Denials for '$_path':"
             printf "  %s\n" "$(printf '%.0s─' {1..56})"
-            journalctl -u fapolicyd --no-pager -n 100 2>/dev/null | sed 's/^/  /' \
+            local _filtered=""
+            if [[ "$_has_ausearch" == true ]]; then
+                # Show full records (all lines in the block) that contain the path
+                _filtered=$(ausearch -m fanotify -i --start today 2>/dev/null \
+                    | awk -v p="$_path" '
+                        /^----/ { if (blk ~ p) printf "%s", blk; blk="----\n"; next }
+                        { blk = blk $0 "\n" }
+                        END     { if (blk ~ p) printf "%s", blk }
+                    ' || true)
+            elif [[ "$_has_auditlog" == true ]]; then
+                _filtered=$(grep "$_fanotify_pat" "$_audit_log" 2>/dev/null \
+                    | grep -F "$_path" || true)
+            fi
+            if [[ -z "$_filtered" ]]; then
+                echo "  (no denials found for '$_path')"
+            else
+                echo "$_filtered" | sed 's/^/  /'
+            fi
+            ;;
+        4)
+            echo "  fapolicyd service log (last 50 entries):"
+            printf "  %s\n" "$(printf '%.0s─' {1..56})"
+            journalctl -u fapolicyd --no-pager -n 50 2>/dev/null | sed 's/^/  /' \
                 || echo "  (no entries)"
             ;;
-        4) return ;;
+        5) return ;;
         *) echo "  Invalid selection." ;;
     esac
     echo ""
@@ -656,39 +897,41 @@ while true; do
     echo "  ── Status ───────────────────────────────────────────────────"
     echo "    1) View status          — service state, mode, and trust summary"
     echo "    2) Enable / disable     — install, start+enable or stop+disable"
+    echo "    3) Deploy default rules — install the default ruleset into rules.d/"
     echo ""
     echo "  ── Trust Management ─────────────────────────────────────────"
-    echo "    3) View trust list      — list all allowed applications and binaries"
-    echo "    4) Add to trust         — allow a binary or application to run"
-    echo "    5) Remove from trust    — revoke trust; blocks execution in enforcing mode"
-    echo "    6) Sync RPM database    — trust all currently installed RPM packages"
+    echo "    4) View trust list      — list all allowed applications and binaries"
+    echo "    5) Add to trust         — allow a binary or application to run"
+    echo "    6) Remove from trust    — revoke trust; blocks execution in enforcing mode"
+    echo "    7) Sync RPM database    — trust all currently installed RPM packages"
     echo ""
     echo "  ── Discovery ────────────────────────────────────────────────"
-    echo "    7) Scan for executables — list binaries in standard system paths"
-    echo "    8) Find untrusted       — show executables not in the trust database"
+    echo "    8) Scan for executables — list binaries in standard system paths"
+    echo "    9) Find untrusted       — show executables not in the trust database"
     echo ""
     echo "  ── Policy ───────────────────────────────────────────────────"
-    echo "    9) Set mode             — permissive (log only) or enforcing (block)"
-    echo "   10) View audit log       — show fapolicyd denials from journal"
+    echo "   10) Set mode             — permissive (log only) or enforcing (block)"
+    echo "   11) View audit log       — show fapolicyd denials from journal"
     echo ""
     echo "  ─────────────────────────────────────────────────────────────"
-    echo "   11) Exit"
+    echo "   12) Exit"
     echo ""
-    read -rp "  Selection [1-11, default=1]: " _sel
+    read -rp "  Selection [1-12, default=1]: " _sel
     echo ""
 
     case "${_sel:-1}" in
          1) action_show_status ;;
          2) action_toggle ;;
-         3) action_view_trust ;;
-         4) action_add_trust ;;
-         5) action_remove_trust ;;
-         6) action_sync_rpm ;;
-         7) action_scan_binaries ;;
-         8) action_find_untrusted ;;
-         9) action_set_mode ;;
-        10) action_view_audit_log ;;
-        11) log_info "Exiting application control module."; exit 0 ;;
+         3) _deploy_default_rules ;;
+         4) action_view_trust ;;
+         5) action_add_trust ;;
+         6) action_remove_trust ;;
+         7) action_sync_rpm ;;
+         8) action_scan_binaries ;;
+         9) action_find_untrusted ;;
+        10) action_set_mode ;;
+        11) action_view_audit_log ;;
+        12) log_info "Exiting application control module."; exit 0 ;;
          *) echo "  Invalid selection." ;;
     esac
 
