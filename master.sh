@@ -35,7 +35,7 @@ CATEGORY_NAMES=(
     "Access Control"
     "System & Communication Protection"
     "Networking & Firewall"
-    "Expansion"
+    "App Control & Auditing"
 )
 
 CATEGORY_DESCS=(
@@ -43,7 +43,7 @@ CATEGORY_DESCS=(
     "Password policy, user administration, logon banners, and session timeouts"
     "Antivirus, USB control, FIPS compliance, system updates, and time sync"
     "Network interface configuration — IP addressing and network controls"
-    "Application allow-listing, package removal, filesystem hardening, and audit logging"
+    "Application allow-listing (fapolicyd), audit logging (auditd), package removal, and filesystem hardening"
 )
 
 CATEGORY_MODULES_prerequisites="hostname smtp_relay"
